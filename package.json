@@ -1,0 +1,13 @@
+{
+  "name": "cpu-metrics-compare-tool",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-platform CPU metrics comparison tool for Node.js, systeminformation, and OS-native counters",
+  "main": "cpu-metrics-compare.js",
+  "scripts": {
+    "compare": "node cpu-metrics-compare.js"
+  },
+  "dependencies": {
+    "systeminformation": "^5.23.7"
+  }
+}
