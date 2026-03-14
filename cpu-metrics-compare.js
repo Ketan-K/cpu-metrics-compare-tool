@@ -30,6 +30,10 @@ function getArgValue(name, fallback) {
   return fallback;
 }
 
+function hasFlag(name) {
+  return process.argv.includes(name);
+}
+
 function toNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -248,6 +252,160 @@ function printBandStats(label, values) {
     return;
   }
   console.log(`${label}: avg=${fmt(s.avg)} min=${fmt(s.min)} max=${fmt(s.max)} count=${s.count}`);
+}
+
+function formatPct(value) {
+  return Number.isFinite(value) ? `${fmt(value)}%` : "n/a";
+}
+
+function toMarkdownCell(value) {
+  return String(value).replace(/\|/g, "\\|");
+}
+
+function toMarkdownTable(headers, rows) {
+  if (!rows.length) {
+    return "(no data)";
+  }
+  const head = `| ${headers.map(toMarkdownCell).join(" | ")} |`;
+  const sep = `| ${headers.map(() => "---").join(" | ")} |`;
+  const body = rows.map(row => `| ${row.map(toMarkdownCell).join(" | ")} |`).join("\n");
+  return `${head}\n${sep}\n${body}`;
+}
+
+function chooseRecommendation(legacyEvidence, siEvidence, sampleCount, outlierPct) {
+  const maeGap = legacyEvidence.mae - siEvidence.mae;
+  const absMaeGap = Math.abs(maeGap);
+
+  // If difference is tiny, avoid claiming a winner.
+  if (!Number.isFinite(absMaeGap) || absMaeGap < 0.5) {
+    return {
+      winner: "no-material-difference",
+      reason: `MAE gap is small (${fmt(absMaeGap)}).`,
+      confidence: "low"
+    };
+  }
+
+  const winner = maeGap > 0 ? "si_currentLoad_percent" : "legacy_os_cpus_percent";
+
+  let confidence = "low";
+  if (sampleCount >= 150 && absMaeGap >= 1 && outlierPct < 15) {
+    confidence = "high";
+  } else if (sampleCount >= 60 && absMaeGap >= 0.5) {
+    confidence = "medium";
+  }
+
+  return {
+    winner,
+    reason: `Winner has lower MAE by ${fmt(absMaeGap)} points.`,
+    confidence
+  };
+}
+
+function buildSummaryText({
+  platform,
+  config,
+  counts,
+  summaryRows,
+  analysisRows,
+  referenceInfo,
+  legacyEvidence,
+  siEvidence,
+  recommendation,
+  bandDiffs,
+  outputPath
+}) {
+  const bandLow = stats(bandDiffs.low);
+  const bandMedium = stats(bandDiffs.medium);
+  const bandHigh = stats(bandDiffs.high);
+
+  const lines = [];
+  lines.push("# CPU Metrics Comparison Summary");
+  lines.push("");
+  lines.push("## Run Context");
+  lines.push(`- platform: ${platform}`);
+  lines.push(`- interval_ms: ${config.intervalMs}`);
+  lines.push(`- duration_sec: ${config.durationSec}`);
+  lines.push(`- warmup_sec: ${config.warmupSec}`);
+  lines.push(`- low_band_max: ${config.lowBandMax}`);
+  lines.push(`- medium_band_max: ${config.mediumBandMax}`);
+  lines.push(`- csv_output: ${outputPath}`);
+  lines.push("");
+  lines.push("## Data Quality");
+  lines.push(`- total_samples: ${counts.total}`);
+  lines.push(`- analysis_samples: ${counts.analysis}`);
+  lines.push(`- warmup_samples: ${counts.warmup}`);
+  lines.push(`- outliers: ${counts.outliers} (${fmt(counts.outlierPct)}%)`);
+  lines.push("");
+
+  lines.push("## Summary Statistics");
+  lines.push(
+    toMarkdownTable(
+      ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
+      summaryRows
+    )
+  );
+  lines.push("");
+
+  lines.push("## Analysis Excluding Warmup");
+  lines.push(
+    toMarkdownTable(
+      ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
+      analysisRows
+    )
+  );
+  lines.push("");
+
+  lines.push("## Load Band Definitions");
+  lines.push(
+    toMarkdownTable(
+      ["Band", "Rule", "Metric Used"],
+      [
+        ["low", `currentLoad < ${config.lowBandMax}%`, "systeminformation currentLoad"],
+        ["medium", `currentLoad >= ${config.lowBandMax}% and < ${config.mediumBandMax}%`, "systeminformation currentLoad"],
+        ["high", `currentLoad >= ${config.mediumBandMax}%`, "systeminformation currentLoad"]
+      ]
+    )
+  );
+  lines.push("");
+
+  if (!referenceInfo || !legacyEvidence || !siEvidence) {
+    lines.push("## Recommendation");
+    lines.push("- Insufficient reference data for final recommendation.");
+    lines.push("- Collect more runs and ensure platform reference metric is available.");
+    return lines.join("\n");
+  }
+
+  lines.push("## Evidence (Against Platform Reference)");
+  lines.push(`reference: ${referenceInfo.metric} (${referenceInfo.label})`);
+  lines.push("");
+  lines.push(
+    toMarkdownTable(
+      ["Metric", "Mean Absolute Error", "Root Mean Squared Error", "Mean Bias", "Correlation", "Composite Score"],
+      [
+        ["legacy_os_cpus_percent", fmt(legacyEvidence.mae), fmt(legacyEvidence.rmse), fmt(legacyEvidence.bias), fmt(legacyEvidence.corr, 3), fmt(legacyEvidence.score)],
+        ["si_currentLoad_percent", fmt(siEvidence.mae), fmt(siEvidence.rmse), fmt(siEvidence.bias), fmt(siEvidence.corr, 3), fmt(siEvidence.score)]
+      ]
+    )
+  );
+  lines.push("");
+
+  lines.push("## Band Snapshot (systeminformation minus legacy)");
+  lines.push(`- low: avg ${formatPct(bandLow ? bandLow.avg : NaN)} (n=${bandLow ? bandLow.count : 0})`);
+  lines.push(`- medium: avg ${formatPct(bandMedium ? bandMedium.avg : NaN)} (n=${bandMedium ? bandMedium.count : 0})`);
+  lines.push(`- high: avg ${formatPct(bandHigh ? bandHigh.avg : NaN)} (n=${bandHigh ? bandHigh.count : 0})`);
+  lines.push("");
+
+  lines.push("## Recommendation");
+  if (recommendation.winner === "no-material-difference") {
+    lines.push(`- decision: no-material-difference`);
+  } else {
+    lines.push(`- decision: prefer ${recommendation.winner}`);
+  }
+  lines.push(`- confidence: ${recommendation.confidence}`);
+  lines.push(`- reason: ${recommendation.reason}`);
+  lines.push("- abbreviation guide: MAE = Mean Absolute Error, RMSE = Root Mean Squared Error");
+
+  return lines.join("\n");
 }
 
 function printInterpretation({
@@ -523,10 +681,20 @@ async function main() {
     mediumMax: mediumBandMax
   };
   const outputArg = getArgValue("--output", "");
+  const summaryArg = getArgValue("--summary-file", "");
+  const verbose = hasFlag("--verbose");
+  const runStamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const defaultRunDir = path.resolve("results", runStamp);
   const outputPath = outputArg
     ? path.resolve(outputArg)
-    : path.resolve(`cpu-compare-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`);
+    : path.join(defaultRunDir, "cpu-metrics.csv");
+  const summaryPath = summaryArg
+    ? path.resolve(summaryArg)
+    : path.join(path.dirname(outputPath), "summary.md");
   const referenceInfo = getReferenceMetricInfo();
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.mkdirSync(path.dirname(summaryPath), { recursive: true });
 
   const startAt = Date.now();
   let shouldStop = false;
@@ -589,6 +757,7 @@ async function main() {
   let warmupSamples = 0;
 
   const stopAt = Date.now() + durationSec * 1000;
+  const expectedSamples = Math.max(1, Math.round((durationSec * 1000) / intervalMs));
   let sampleCount = 0;
 
   while (Date.now() < stopAt && !shouldStop) {
@@ -722,7 +891,21 @@ async function main() {
     const winText = Number.isFinite(winUsed) ? ` win=${fmt(winUsed)}%` : "";
     const outlierText = isOutlier ? " outlier=YES" : "";
     const warmupText = isWarmup ? " phase=warmup" : ` band=${loadBand}`;
-    console.log(`[${sampleCount}] ${ts} legacy=${legacy}% si=${siLoad}%${topText}${winText} diff=${sign}${diff}%${warmupText}${outlierText}`);
+    if (verbose) {
+      console.log(`[${sampleCount}] ${ts} legacy=${legacy}% si=${siLoad}%${topText}${winText} diff=${sign}${diff}%${warmupText}${outlierText}`);
+    } else {
+      const elapsed = Date.now() - startAt;
+      const progress = Math.max(0, Math.min(1, elapsed / (durationSec * 1000)));
+      const percent = Math.round(progress * 100);
+      const barWidth = 24;
+      const filled = Math.round(progress * barWidth);
+      const bar = `${"#".repeat(filled)}${"-".repeat(barWidth - filled)}`;
+      process.stdout.write(`\rProgress [${bar}] ${percent}% | samples ${sampleCount}/${expectedSamples}`);
+    }
+  }
+
+  if (!verbose) {
+    process.stdout.write("\n");
   }
 
   const summaryRows = [
@@ -743,11 +926,13 @@ async function main() {
     summaryRows.push(metricRow("Difference: Windows counter minus systeminformation", stats(diffWinSiValues)));
   }
 
-  printTable(
-    "Summary Statistics",
-    ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
-    summaryRows
-  );
+  if (verbose) {
+    printTable(
+      "Summary Statistics",
+      ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
+      summaryRows
+    );
+  }
 
   const analysisRows = [
     metricRow("Legacy os.cpus percentage", stats(analysisLegacy)),
@@ -758,48 +943,84 @@ async function main() {
     metricRow("Difference at high load band", stats(bandDiffs.high))
   ];
 
-  printTable(
-    "Analysis Excluding Warmup",
-    ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
-    analysisRows
-  );
+  if (verbose) {
+    printTable(
+      "Analysis Excluding Warmup",
+      ["Metric", "Count", "Minimum", "Maximum", "Average", "Median", "90th Percentile"],
+      analysisRows
+    );
+  }
 
-  printTable(
-    "Load Band Definitions",
-    ["Band", "Rule", "Metric Used"],
-    [
-      ["low", `currentLoad < ${loadBandThresholds.lowMax}%`, "systeminformation currentLoad"],
+  if (verbose) {
+    printTable(
+      "Load Band Definitions",
+      ["Band", "Rule", "Metric Used"],
       [
-        "medium",
-        `currentLoad >= ${loadBandThresholds.lowMax}% and < ${loadBandThresholds.mediumMax}%`,
-        "systeminformation currentLoad"
-      ],
-      ["high", `currentLoad >= ${loadBandThresholds.mediumMax}%`, "systeminformation currentLoad"]
-    ]
-  );
+        ["low", `currentLoad < ${loadBandThresholds.lowMax}%`, "systeminformation currentLoad"],
+        [
+          "medium",
+          `currentLoad >= ${loadBandThresholds.lowMax}% and < ${loadBandThresholds.mediumMax}%`,
+          "systeminformation currentLoad"
+        ],
+        ["high", `currentLoad >= ${loadBandThresholds.mediumMax}%`, "systeminformation currentLoad"]
+      ]
+    );
+  }
 
-  const corr = correlation(analysisLegacy, analysisSi);
-  const directionAgreement = trendComparableCount
-    ? trendSameDirectionCount / trendComparableCount
-    : NaN;
-  const diffAvg = mean(analysisDiffs);
-  const diffStd = stddev(analysisDiffs);
+  let legacyEvidence;
+  let siEvidence;
+  let recommendation = {
+    winner: "no-material-difference",
+    reason: "No usable reference evidence.",
+    confidence: "low"
+  };
 
-  printInterpretation({
-    diffAvg,
-    diffStd,
-    corr,
-    directionAgreement,
-    outlierCount,
-    sampleCount: analysisDiffs.length,
-    warmupSamples,
-    bandDiffs
+  if (referenceInfo && analysisReferenceRows.length >= 8) {
+    const refs = analysisReferenceRows.map(item => item.ref);
+    const legacyPred = analysisReferenceRows.map(item => item.legacy);
+    const siPred = analysisReferenceRows.map(item => item.si);
+    legacyEvidence = buildEvidence("legacy_os_cpus_percent", legacyPred, refs);
+    siEvidence = buildEvidence("si_currentLoad_percent", siPred, refs);
+    const outlierPctForDecision = analysisDiffs.length ? (outlierCount / analysisDiffs.length) * 100 : 100;
+    recommendation = chooseRecommendation(legacyEvidence, siEvidence, analysisReferenceRows.length, outlierPctForDecision);
+  }
+
+  const outlierPct = analysisDiffs.length ? (outlierCount / analysisDiffs.length) * 100 : NaN;
+  const summaryText = buildSummaryText({
+    platform: process.platform,
+    config: {
+      intervalMs,
+      durationSec,
+      warmupSec,
+      lowBandMax: loadBandThresholds.lowMax,
+      mediumBandMax: loadBandThresholds.mediumMax
+    },
+    counts: {
+      total: sampleCount,
+      analysis: analysisDiffs.length,
+      warmup: warmupSamples,
+      outliers: outlierCount,
+      outlierPct
+    },
+    summaryRows,
+    analysisRows,
+    referenceInfo,
+    legacyEvidence,
+    siEvidence,
+    recommendation,
+    bandDiffs,
+    outputPath
   });
 
-  printEvidenceAndConclusion(analysisReferenceRows, referenceInfo);
+  fs.writeFileSync(summaryPath, `${summaryText}\n`, "utf8");
 
   console.log(`CSV saved: ${outputPath}`);
-  console.log("Tip: Compare timestamps with Activity Monitor CPU Load graph while running a controlled workload.");
+  console.log(`Summary saved: ${summaryPath}`);
+  if (recommendation.winner === "no-material-difference") {
+    console.log("Recommendation: no-material-difference (see summary file)");
+  } else {
+    console.log(`Recommendation: prefer ${recommendation.winner} (${recommendation.confidence} confidence)`);
+  }
 }
 
 main().catch(error => {
